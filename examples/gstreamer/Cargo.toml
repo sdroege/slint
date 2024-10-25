@@ -17,11 +17,11 @@ name = "gstreamer"
 [dependencies]
 slint = { path = "../../api/rs/slint" }
 
-gstreamer = "0.18.0"
-gstreamer-app = "0.18.0"
-gstreamer-gl = "0.18.0"
-gstreamer-gl-egl = "0.18.0"
-gstreamer-video = "0.18.0"
+gst = { package = "gstreamer", version = "0.23.0" }
+gst-app = { package = "gstreamer-app", version = "0.23.0" }
+gst-gl = { package = "gstreamer-gl", version = "0.23.0" }
+gst-gl-egl = { package = "gstreamer-gl-egl", version = "0.23.0" }
+gst-video = { package = "gstreamer-video", version = "0.23.0" }
 
 anyhow = "1.0"
 glutin_egl_sys = "0.1.5"
