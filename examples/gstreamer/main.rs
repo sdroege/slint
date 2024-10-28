@@ -4,13 +4,16 @@
 use gst::prelude::*;
 use gst_gl::prelude::*;
 
+use std::sync::{Arc, Mutex};
+
 slint::include_modules!();
 
 struct Player<C: slint::ComponentHandle + 'static> {
     app: slint::Weak<C>,
     pipeline: gst::Pipeline,
     appsink: gst_app::AppSink,
-    current_sample: std::sync::Arc<std::sync::Mutex<Option<gst::Sample>>>,
+    next_frame: Arc<Mutex<Option<(gst_video::VideoInfo, gst::Buffer)>>>,
+    current_frame: Mutex<Option<gst_gl::GLVideoFrame<gst_gl::gl_video_frame::Readable>>>,
     gst_gl_context: Option<gst_gl::GLContext>,
 }
 
@@ -48,7 +51,8 @@ impl<C: slint::ComponentHandle + 'static> Player<C> {
             app,
             pipeline,
             appsink,
-            current_sample: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            next_frame: Arc::new(Mutex::new(None)),
+            current_frame: Mutex::new(None),
             gst_gl_context: None,
         })
     }
@@ -84,7 +88,6 @@ impl<C: slint::ComponentHandle + 'static> Player<C> {
 
         gst_gl_context.activate(true).expect("could not activate GStreamer GL context");
         gst_gl_context.fill_info().expect("failed to fill GL info for wrapped context");
-        gst_gl_context.activate(false).expect("could not deactivate GStreamer GL context");
 
         self.gst_gl_context = Some(gst_gl_context.clone());
 
@@ -126,18 +129,47 @@ impl<C: slint::ComponentHandle + 'static> Player<C> {
 
         let app_weak = self.app.clone();
 
-        let current_sample_ref = self.current_sample.clone();
+        let current_sample_ref = self.next_frame.clone();
 
         self.appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |appsink| {
                     let sample = appsink.pull_sample().map_err(|_| gst::FlowError::Flushing)?;
 
-                    let current_sample_ref = current_sample_ref.clone();
+                    let mut buffer = sample.buffer_owned().unwrap();
+                    {
+                        let context = match (buffer.n_memory() > 0)
+                            .then(|| buffer.peek_memory(0))
+                            .and_then(|m| m.downcast_memory_ref::<gst_gl::GLBaseMemory>())
+                            .map(|m| m.context())
+                        {
+                            Some(context) => context.clone(),
+                            None => {
+                                eprintln!("Got non-GL memory");
+                                return Err(gst::FlowError::Error);
+                            }
+                        };
 
+                        if let Some(meta) = buffer.meta::<gst_gl::GLSyncMeta>() {
+                            meta.set_sync_point(&context);
+                        } else {
+                            let buffer = buffer.make_mut();
+                            let meta = gst_gl::GLSyncMeta::add(buffer, &context);
+                            meta.set_sync_point(&context);
+                        }
+                    }
+
+                    let Some(info) =
+                        sample.caps().and_then(|caps| gst_video::VideoInfo::from_caps(caps).ok())
+                    else {
+                        eprintln!("Got invalid caps");
+                        return Err(gst::FlowError::NotNegotiated);
+                    };
+
+                    let current_sample_ref = current_sample_ref.clone();
                     app_weak
                         .upgrade_in_event_loop(move |app| {
-                            *current_sample_ref.lock().unwrap() = Some(sample);
+                            *current_sample_ref.lock().unwrap() = Some((info, buffer));
 
                             app.window().request_redraw();
                         })
@@ -154,8 +186,12 @@ impl<C: slint::ComponentHandle + 'static> Player<C> {
 
 impl<C: slint::ComponentHandle + 'static> Drop for Player<C> {
     fn drop(&mut self) {
-        *self.current_sample.lock().unwrap() = None;
+        *self.next_frame.lock().unwrap() = None;
+        *self.current_frame.lock().unwrap() = None;
         let _ = self.pipeline.set_state(gst::State::Null);
+        if let Some(ref gst_gl_context) = self.gst_gl_context {
+            gst_gl_context.activate(false).expect("could not deactivate GStreamer GL context");
+        }
     }
 }
 
@@ -172,37 +208,36 @@ pub fn main() -> Result<(), anyhow::Error> {
                 player.setup_graphics(graphics_api);
             }
             slint::RenderingState::RenderingTeardown => {
-                *player.current_sample.lock().unwrap() = None;
+                *player.next_frame.lock().unwrap() = None;
+                *player.current_frame.lock().unwrap() = None;
                 let _ = player.pipeline.set_state(gst::State::Null);
+                if let Some(ref gst_gl_context) = player.gst_gl_context {
+                    gst_gl_context
+                        .activate(false)
+                        .expect("could not deactivate GStreamer GL context");
+                }
             }
             slint::RenderingState::BeforeRendering => {
-                if let Some(sample) = player.current_sample.lock().unwrap().as_ref() {
-                    let buffer = sample.buffer_owned().unwrap();
-                    let info = sample
-                        .caps()
-                        .map(|caps| gst_video::VideoInfo::from_caps(caps).unwrap())
-                        .unwrap();
-
-                    {
-                        // let sync_meta = buffer.meta::<gst_gl::GLSyncMeta>().unwrap();
-                        // sync_meta.set_sync_point(player.gst_gl_context.as_ref().unwrap());
-                    }
+                if let Some((info, buffer)) = player.next_frame.lock().unwrap().take() {
+                    let sync_meta = buffer.meta::<gst_gl::GLSyncMeta>().unwrap();
+                    sync_meta.wait(player.gst_gl_context.as_ref().unwrap());
 
                     if let Ok(frame) = gst_gl::GLVideoFrame::from_buffer_readable(buffer, &info) {
-                        //let sync_meta = frame.buffer().meta::<gst_gl::GLSyncMeta>().unwrap();
-                        //sync_meta.wait(player.gst_gl_context.as_ref().unwrap());
+                        *player.current_frame.lock().unwrap() = Some(frame);
+                    }
+                }
 
-                        if let Some(texture) =
-                            frame.texture_id(0).ok().and_then(|id| id.try_into().ok())
-                        {
-                            mw_weak.unwrap().set_texture(unsafe {
-                                slint::BorrowedOpenGLTextureBuilder::new_gl_2d_rgba_texture(
-                                    texture,
-                                    [frame.width(), frame.height()].into(),
-                                )
-                                .build()
-                            });
-                        }
+                if let Some(frame) = player.current_frame.lock().unwrap().as_ref() {
+                    if let Some(texture) =
+                        frame.texture_id(0).ok().and_then(|id| id.try_into().ok())
+                    {
+                        mw_weak.unwrap().set_texture(unsafe {
+                            slint::BorrowedOpenGLTextureBuilder::new_gl_2d_rgba_texture(
+                                texture,
+                                [frame.width(), frame.height()].into(),
+                            )
+                            .build()
+                        });
                     }
                 }
             }
